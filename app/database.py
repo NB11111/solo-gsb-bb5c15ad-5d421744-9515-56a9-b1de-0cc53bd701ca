@@ -73,22 +73,14 @@ CREATE TABLE IF NOT EXISTS batch_results (
     FOREIGN KEY (batch_id) REFERENCES batches(batch_id)
 );
 
--- 保留期冻结：每次冻结以某封“有效邮件”为锚点，保护冻结时刻其所在的
--- 整棵会话（成员快照存于 retention_freeze_members）。解除冻结删除锚点行，
--- 成员行随之级联清除。
+-- 保留期冻结：每次冻结以某封“有效邮件”为锚点，活跃保护其当前所在的
+-- 整棵会话。不存成员快照——保护集合在清理/查询时按当前父子关系实时
+-- 展开锚点所在会话计算，此后并入该会话的邮件自动受保护；解除冻结
+-- 删除锚点行即可。
 CREATE TABLE IF NOT EXISTS retention_freezes (
     anchor_id    TEXT PRIMARY KEY,
     frozen_at    TEXT NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS retention_freeze_members (
-    anchor_id    TEXT NOT NULL,
-    message_id   TEXT NOT NULL,
-    PRIMARY KEY (anchor_id, message_id),
-    FOREIGN KEY (anchor_id) REFERENCES retention_freezes(anchor_id) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_freeze_members_message
-    ON retention_freeze_members(message_id);
 """
 
 _write_lock = threading.Lock()
@@ -104,7 +96,10 @@ def connect() -> sqlite3.Connection:
 def init_db(db_path: Optional[Path] = None) -> None:
     """确保数据目录存在并执行建表 DDL（幂等）。
 
-    对早期版本（messages 无 retain_until 列）做一次幂等补列迁移。
+    幂等迁移：
+    - 早期版本 messages 无 retain_until 列 -> 补列；
+    - 早期版本把冻结成员快照存于 retention_freeze_members -> 现改为
+      活跃冻结（按当前父子关系实时计算保护集合），快照表不再需要，删除。
     """
 
     path = db_path or settings.database_path
@@ -119,6 +114,8 @@ def init_db(db_path: Optional[Path] = None) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_retain ON messages(retain_until)"
         )
+        # 活跃冻结迁移：废弃快照成员表（重复执行为 no-op）
+        conn.execute("DROP TABLE IF EXISTS retention_freeze_members")
         conn.commit()
     finally:
         conn.close()

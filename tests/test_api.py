@@ -648,7 +648,7 @@ def test_freeze_protects_whole_current_thread(client):
     assert client.get("/messages/D").json()["frozen"] is True
 
 
-def test_freeze_refreshes_snapshot_when_thread_grows(client):
+def test_freeze_is_active_and_covers_later_members_automatically(client):
     # 首次冻结时树只有 R -> A
     client.post("/batches", json={"messages": [
         _m("R", sent="2026-09-18T08:00:00+00:00"),
@@ -658,14 +658,14 @@ def test_freeze_refreshes_snapshot_when_thread_grows(client):
     assert first["created"] is True
     assert first["members"] == ["R", "A"]
 
-    # 新邮件并入同一会话；冻结快照不自动扩张
+    # 新邮件并入同一会话：活跃冻结随拓扑自动覆盖，无需再次冻结
     client.post("/batches", json={"messages": [
         _m("D", irt="R", refs=["R"], sent="2026-09-18T11:00:00+00:00",
            retain_until="2026-09-19T00:00:00+00:00"),
     ]})
-    assert client.get("/messages/D").json()["frozen"] is False
+    assert client.get("/messages/D").json()["frozen"] is True
 
-    # 再次冻结同一锚点 -> created=false，成员刷新
+    # 再次冻结同一锚点 -> created=false，members 仍反映当前会话
     again = client.post("/retention/freezes", json={"message_id": "A"}).json()
     assert again["created"] is False
     assert again["members"] == ["R", "A", "D"]
@@ -932,9 +932,9 @@ def test_paged_thread_cursor_is_stale_after_cleanup_compression(client):
     assert fresh["next_cursor"] is None
 
 
-def test_node_joining_thread_after_freeze_is_not_protected(client):
+def test_node_joining_thread_after_freeze_is_protected(client):
     # 冻结时树为 R -> A；之后新邮件 N 到期并挂到被冻结的 A 下。
-    # 冻结只保护快照成员，N 不在其中；删除 N 时 A 存活，无重挂。
+    # 活跃冻结随会话拓扑扩张：N 自动受保护，清理不得删除。
     client.post("/batches", json={"messages": [
         _m("R", sent="2026-09-18T08:00:00+00:00"),
         _m("A", irt="R", refs=["R"], sent="2026-09-18T09:00:00+00:00"),
@@ -944,19 +944,22 @@ def test_node_joining_thread_after_freeze_is_not_protected(client):
         _m("N", irt="A", refs=["R", "A"], sent="2026-09-18T12:00:00+00:00",
            retain_until="2026-09-19T00:00:00+00:00"),
     ]})
-    assert client.get("/messages/N").json()["frozen"] is False
+    assert client.get("/messages/N").json()["frozen"] is True
 
     body = client.post("/retention/cleanups", json={"cutoff": CUTOFF}).json()
-    assert body["deleted_ids"] == ["N"]
+    assert body["deleted_ids"] == []
+    assert body["expired_count"] == 1      # 仅 N 到期
+    assert body["protected_count"] == 1    # N 被活跃冻结保护
     assert body["affected"] == []
-    # 被冻结的 R/A 原样保留
+    # 被冻结的 R/A/N 原样保留
     assert client.get("/messages/A").json()["parent_id"] == "R"
     tree = client.get("/threads/R").json()
     assert tree["root_id"] == "R"
     assert [c["message_id"] for c in tree["tree"]["children"]] == ["A"]
+    assert [g["message_id"] for g in tree["tree"]["children"][0]["children"]] == ["N"]
 
 
-def test_cleanup_freeze_member_rows_survive_and_unfreeze_after_cleanup(client):
+def test_cleanup_keeps_frozen_thread_and_unfreeze_releases_it(client):
     # R(到期) 被冻结保护 -> 清理不删；解除冻结后再清理
     client.post("/batches", json={"messages": [
         _m("R", retain_until="2026-09-19T00:00:00+00:00"),
@@ -972,3 +975,152 @@ def test_cleanup_freeze_member_rows_survive_and_unfreeze_after_cleanup(client):
     impact = {i["message_id"]: i for i in body["affected"]}
     assert impact["A"]["new_parent_id"] is None
     assert impact["A"]["new_root_id"] == "A"
+
+
+# ---------------------------------------------------------------------------
+# 活跃冻结：保护范围随会话拓扑实时扩张
+# ---------------------------------------------------------------------------
+
+
+def test_relink_into_frozen_thread_is_protected(client):
+    # D 断链为根（其父 late 尚未到达）；冻结 D 当前所在会话（此时仅 D 自身）
+    client.post("/batches", json={"messages": [
+        _m("D", irt="late", refs=["late"], sent="2026-09-18T09:00:00+00:00"),
+    ]})
+    client.post("/retention/freezes", json={"message_id": "D"})
+
+    # 迟到邮件归档后补链：D 并入 late 的会话，活跃冻结随拓扑覆盖整棵新会话
+    client.post("/batches", json={"messages": [
+        _m("late", sent="2026-09-18T07:00:00+00:00",
+           retain_until="2026-09-19T00:00:00+00:00"),
+    ]})
+    r = client.post("/relinks", json={"message_ids": ["D"]})
+    assert r.json()["results"][0]["new_parent_id"] == "late"
+
+    # late 到期但被并入后的活跃冻结保护，无需再次冻结
+    assert client.get("/messages/late").json()["frozen"] is True
+    assert client.get("/messages/D").json()["frozen"] is True
+    body = client.post("/retention/cleanups", json={"cutoff": CUTOFF}).json()
+    assert body["deleted_ids"] == []
+    assert body["protected_count"] == 1
+    assert client.get("/messages/late").json()["parent_id"] is None
+
+
+def test_overlapping_freezes_cover_later_members_until_all_released(client):
+    client.post("/batches", json={"messages": [
+        _m("R", sent="2026-09-18T08:00:00+00:00"),
+        _m("A", irt="R", refs=["R"], sent="2026-09-18T09:00:00+00:00"),
+    ]})
+    client.post("/retention/freezes", json={"message_id": "R"})
+    client.post("/retention/freezes", json={"message_id": "A"})
+
+    # 双重冻结后新邮件并入同一会话：两个锚点的保护都随拓扑覆盖 N
+    client.post("/batches", json={"messages": [
+        _m("N", irt="A", refs=["A"], sent="2026-09-18T10:00:00+00:00",
+           retain_until="2026-09-19T00:00:00+00:00"),
+    ]})
+    assert client.get("/messages/N").json()["frozen"] is True
+
+    # 解除一个锚点：N 仍被另一锚点覆盖，不得释放
+    body = client.post("/retention/unfreezes", json={"message_id": "R"}).json()
+    assert body["released_members"] == []
+    assert body["still_protected"] == ["A", "N", "R"]
+    assert client.get("/messages/N").json()["frozen"] is True
+    assert client.post(
+        "/retention/cleanups", json={"cutoff": CUTOFF}
+    ).json()["deleted_ids"] == []
+
+    # 全部解除后才真正释放
+    body2 = client.post("/retention/unfreezes", json={"message_id": "A"}).json()
+    assert body2["released_members"] == ["A", "N", "R"]
+    assert body2["still_protected"] == []
+    assert client.get("/messages/N").json()["frozen"] is False
+    assert client.post(
+        "/retention/cleanups", json={"cutoff": CUTOFF}
+    ).json()["deleted_ids"] == ["N"]
+
+
+def test_cleanup_dry_run_and_actual_see_same_active_protection(client):
+    # 冻结后新并入的到期邮件：dry_run 与实际执行按同一当前拓扑计算保护集合
+    client.post("/batches", json={"messages": [
+        _m("R", sent="2026-09-18T08:00:00+00:00"),
+    ]})
+    client.post("/retention/freezes", json={"message_id": "R"})
+    client.post("/batches", json={"messages": [
+        _m("N", irt="R", refs=["R"], sent="2026-09-18T09:00:00+00:00",
+           retain_until="2026-09-19T00:00:00+00:00"),
+    ]})
+
+    dry = client.post(
+        "/retention/cleanups", json={"cutoff": CUTOFF, "dry_run": True}
+    ).json()
+    assert dry["deleted_ids"] == []
+    assert dry["protected_count"] == 1
+    # dry_run 不写库
+    assert client.get("/messages/N").status_code == 200
+
+    actual = client.post("/retention/cleanups", json={"cutoff": CUTOFF}).json()
+    assert actual["deleted_ids"] == dry["deleted_ids"]
+    assert actual["protected_count"] == dry["protected_count"]
+    assert actual["expired_count"] == dry["expired_count"]
+    assert client.get("/messages/N").status_code == 200
+
+
+def test_init_db_migrates_legacy_snapshot_table(tmp_path):
+    # 早期库：messages 无 retain_until 列，冻结成员快照存于 retention_freeze_members
+    import sqlite3
+
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE TABLE messages (
+            message_id   TEXT PRIMARY KEY,
+            in_reply_to  TEXT,
+            "references" TEXT NOT NULL DEFAULT '[]',
+            sent_at      TEXT NOT NULL,
+            subject      TEXT NOT NULL,
+            parent_id    TEXT,
+            is_invalid   INTEGER NOT NULL DEFAULT 0,
+            batch_id     TEXT NOT NULL,
+            submitted_seq INTEGER NOT NULL,
+            archived_at  TEXT NOT NULL
+        );
+        CREATE TABLE retention_freezes (
+            anchor_id TEXT PRIMARY KEY,
+            frozen_at TEXT NOT NULL
+        );
+        CREATE TABLE retention_freeze_members (
+            anchor_id  TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            PRIMARY KEY (anchor_id, message_id),
+            FOREIGN KEY (anchor_id) REFERENCES retention_freezes(anchor_id) ON DELETE CASCADE
+        );
+    """)
+    conn.execute(
+        "INSERT INTO retention_freezes VALUES ('A', '2026-09-19T00:00:00+00:00')"
+    )
+    conn.execute("INSERT INTO retention_freeze_members VALUES ('A', 'A')")
+    conn.commit()
+    conn.close()
+
+    from app import database
+
+    database.init_db(db_path=db)
+    database.init_db(db_path=db)  # 幂等：重复执行不报错、结果不变
+
+    conn = sqlite3.connect(db)
+    try:
+        tables = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert "retention_freeze_members" not in tables  # 快照表已废弃
+        assert "retention_freezes" in tables             # 锚点保留
+        assert conn.execute(
+            "SELECT anchor_id FROM retention_freezes"
+        ).fetchall() == [("A",)]
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+        assert "retain_until" in columns                 # 补列迁移仍生效
+    finally:
+        conn.close()
