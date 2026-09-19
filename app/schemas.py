@@ -167,7 +167,7 @@ class RelinkResult(BaseModel):
 
 
 class FreezeIn(BaseModel):
-    """POST /retention/freezes：以某封有效邮件为锚点冻结其当前整棵会话。"""
+    """POST /retention/freezes：以某封有效邮件为锚点冻结其当前整棵会话（活跃冻结）。"""
 
     message_id: str = Field(..., min_length=1, description="冻结锚点邮件 ID")
 
@@ -183,11 +183,13 @@ class FreezeIn(BaseModel):
 class FreezeResult(BaseModel):
     anchor_id: str = Field(..., description="冻结锚点邮件 ID（会话内任一封邮件）")
     root_id: str = Field(..., description="冻结时刻该会话的根节点 ID")
-    frozen_at: datetime = Field(..., description="冻结（或最近一次刷新）时间，UTC")
+    frozen_at: datetime = Field(..., description="冻结（或最近一次确认）时间，UTC")
     created: bool = Field(
-        ..., description="True=本次新建冻结；False=锚点已有冻结，已按当前会话刷新成员快照"
+        ..., description="True=本次新建冻结；False=锚点已有冻结（保护随会话拓扑持续生效，无需刷新）"
     )
-    members: list[str] = Field(..., description="受保护的整棵会话成员 ID，按先序排列")
+    members: list[str] = Field(
+        ..., description="操作时刻受保护的整棵会话成员 ID，按先序排列；此后并入该会话的邮件自动受保护"
+    )
 
 
 class UnfreezeIn(BaseModel):
@@ -206,11 +208,13 @@ class UnfreezeIn(BaseModel):
 
 class UnfreezeResult(BaseModel):
     anchor_id: str
-    root_id: str = Field(..., description="冻结记录中的会话根 ID")
+    root_id: str = Field(..., description="解除时刻该锚点所在会话的根 ID")
     frozen_at: datetime
-    released_members: list[str] = Field(..., description="本次解除后不再被该冻结覆盖的成员 ID")
+    released_members: list[str] = Field(
+        ..., description="本次解除后不再被任何冻结覆盖的成员 ID（按解除时当前会话计算）"
+    )
     still_protected: list[str] = Field(
-        ..., description="释放成员中仍被其它冻结覆盖、清理时依旧受保护的 ID"
+        ..., description="该锚点当前会话成员中仍被其它冻结覆盖、清理时依旧受保护的 ID"
     )
 
 

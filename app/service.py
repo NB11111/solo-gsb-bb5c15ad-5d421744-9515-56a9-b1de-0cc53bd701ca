@@ -522,10 +522,11 @@ def get_message(message_id: str) -> Optional[dict]:
         ).fetchone()
         if row is None:
             return None
-        frozen = conn.execute(
-            "SELECT 1 FROM retention_freeze_members WHERE message_id = ? LIMIT 1",
-            (message_id,),
-        ).fetchone()
+        # 活跃冻结：按当前父子关系判断该邮件是否落在某个冻结锚点的会话内
+        frozen = (
+            not row["is_invalid"]
+            and _climb_root(conn, message_id) in _anchor_root_ids(conn)
+        )
         return {
             "message_id": row["message_id"],
             "in_reply_to": row["in_reply_to"],
@@ -536,7 +537,7 @@ def get_message(message_id: str) -> Optional[dict]:
             "is_invalid": bool(row["is_invalid"]),
             "batch_id": row["batch_id"],
             "retain_until": row["retain_until"],
-            "frozen": frozen is not None,
+            "frozen": frozen,
         }
     finally:
         conn.close()
@@ -705,24 +706,40 @@ def get_thread_page(
 
 # ---------------------------------------------------------------------------
 # 保留期：会话冻结 / 解除冻结 / 批量清理
+#
+# 活跃冻结：库里只存锚点（retention_freezes），保护集始终按锚点当前所在
+# 会话的父子关系实时计算。新批次归档或 POST /relinks 并入被冻结会话的邮件
+# 自动进入保护集，无需再次冻结；多个冻结重叠时取并集。
 # ---------------------------------------------------------------------------
 
 
-def _load_protected_ids(conn: sqlite3.Connection) -> set[str]:
-    """当前被任一冻结覆盖的全部成员 ID（多冻结取并集）。"""
+def _anchor_root_ids(conn: sqlite3.Connection) -> set[str]:
+    """所有冻结锚点当前所在会话的根 ID 集合（锚点永不会被清理删除）。"""
 
     return {
-        r["message_id"]
-        for r in conn.execute("SELECT DISTINCT message_id FROM retention_freeze_members")
+        _climb_root(conn, r["anchor_id"])
+        for r in conn.execute("SELECT anchor_id FROM retention_freezes")
     }
 
 
-def freeze_thread(payload: FreezeIn) -> dict:
-    """冻结锚点邮件当前所在的整棵会话。
+def _load_protected_ids(conn: sqlite3.Connection) -> set[str]:
+    """当前被任一冻结覆盖的全部成员 ID：各锚点当前会话成员的并集。"""
 
-    冻结只保护“冻结时刻”的成员快照：之后新并入该会话的邮件不受保护，
-    需再次以该锚点冻结来刷新快照。锚点不存在 -> 404；锚点为环内
-    invalid 邮件（不属于任何会话树）-> 409。
+    protected: set[str] = set()
+    for root_id in _anchor_root_ids(conn):
+        msgs, _ = _load_subtree(conn, root_id)
+        protected.update(msgs)
+    return protected
+
+
+def freeze_thread(payload: FreezeIn) -> dict:
+    """冻结锚点邮件当前所在的整棵会话（活跃冻结）。
+
+    冻结只持久化锚点；保护关系随会话拓扑实时生效——之后经新批次归档或
+    POST /relinks 并入该会话的邮件自动受保护，无需再次冻结。对同一锚点
+    重复调用为幂等确认（created=False，frozen_at 刷新），members 始终
+    返回操作时刻的当前会话成员。锚点不存在 -> 404；锚点为环内 invalid
+    邮件（不属于任何会话树）-> 409。
     """
 
     anchor_id = payload.message_id
@@ -762,15 +779,6 @@ def freeze_thread(payload: FreezeIn) -> dict:
                     "UPDATE retention_freezes SET frozen_at = ? WHERE anchor_id = ?",
                     (frozen_at, anchor_id),
                 )
-                # 刷新成员快照：清掉旧成员后按当前会话重写
-                conn.execute(
-                    "DELETE FROM retention_freeze_members WHERE anchor_id = ?",
-                    (anchor_id,),
-                )
-            conn.executemany(
-                "INSERT INTO retention_freeze_members (anchor_id, message_id) VALUES (?, ?)",
-                [(anchor_id, mid) for mid in members],
-            )
             conn.commit()
             return {
                 "anchor_id": anchor_id,
@@ -787,7 +795,11 @@ def freeze_thread(payload: FreezeIn) -> dict:
 
 
 def unfreeze_thread(payload: UnfreezeIn) -> dict:
-    """解除以锚点邮件建立的冻结，仅释放该冻结独占的保护。"""
+    """解除以锚点邮件建立的冻结，仅释放该冻结独占的保护。
+
+    释放范围按解除时刻的当前会话拓扑计算：该锚点当前会话成员中、仍被
+    其它冻结锚点的会话覆盖的邮件继续保持受保护，其余立即解除。
+    """
 
     anchor_id = payload.message_id
     with database.write_lock():
@@ -801,40 +813,20 @@ def unfreeze_thread(payload: UnfreezeIn) -> dict:
                 raise RetentionFreezeNotFound("freeze not found for anchor message")
             frozen_at = row["frozen_at"]
 
-            members = [
-                r["message_id"]
-                for r in conn.execute(
-                    "SELECT message_id FROM retention_freeze_members WHERE anchor_id = ? ORDER BY message_id",
-                    (anchor_id,),
-                )
-            ]
-
-            # 冻结记录里的根 ID：沿当前父指针上溯（锚点永不会被清理删除）
+            # 该锚点当前覆盖的成员：沿当前父指针取整棵会话
             root_id = _climb_root(conn, anchor_id)
+            msgs, _ = _load_subtree(conn, root_id)
+            members = sorted(msgs)
 
             conn.execute(
                 "DELETE FROM retention_freezes WHERE anchor_id = ?",
                 (anchor_id,),
             )
-            # ON DELETE CASCADE 在独立连接级 PRAGMA 下已开启；这里不依赖它，显式删成员
-            conn.execute(
-                "DELETE FROM retention_freeze_members WHERE anchor_id = ?",
-                (anchor_id,),
-            )
 
-            placeholders = ",".join("?" * len(members))
-            still_protected = (
-                [
-                    r["message_id"]
-                    for r in conn.execute(
-                        f"SELECT DISTINCT message_id FROM retention_freeze_members WHERE message_id IN ({placeholders}) ORDER BY message_id",
-                        members,
-                    )
-                ]
-                if members
-                else []
-            )
-            released_members = [mid for mid in members if mid not in set(still_protected)]
+            # 剩余冻结的并集（同一事务视图、按当前父子关系计算）
+            still = _load_protected_ids(conn)
+            still_protected = [mid for mid in members if mid in still]
+            released_members = [mid for mid in members if mid not in still]
 
             conn.commit()
             return {
@@ -854,7 +846,8 @@ def unfreeze_thread(payload: UnfreezeIn) -> dict:
 def _build_cleanup_plan(
     conn: sqlite3.Connection, cutoff_iso: str
 ) -> tuple[RetentionCleanupPlan, dict[str, Optional[str]]]:
-    """读取当前有效邮件森林并计算到期清理计划（dry_run 与实跑共用）。"""
+    """在当前连接（同一事务视图）上读取有效邮件森林与活跃冻结保护集，
+    计算到期清理计划（dry_run 与实跑共用，均按当前父子关系取保护集）。"""
 
     rows = conn.execute(
         "SELECT message_id, parent_id FROM messages WHERE is_invalid = 0"
@@ -873,11 +866,12 @@ def _build_cleanup_plan(
 
 
 def cleanup_messages(payload: CleanupIn) -> dict:
-    """批量清理截止时刻前已到期、且未被冻结保护的有效邮件。
+    """批量清理截止时刻前已到期、且未被活跃冻结保护的有效邮件。
 
+    保护集按清理时的当前父子关系实时计算（各冻结锚点当前会话的并集）。
     筛出删除集后先在内存父指针图上做整林压缩（最近存活祖先重挂 /
-    提升为新根），dry_run 返回同一算法结论但不写库；实际清理在单事务
-    内完成全部 DELETE 与 parent_id UPDATE。
+    提升为新根），dry_run 在同一事务视图中返回同一算法结论但不写库；
+    实际清理在单事务内完成全部 DELETE 与 parent_id UPDATE。
     """
 
     cutoff_dt = payload.normalized_cutoff() or datetime.now(timezone.utc)

@@ -3,8 +3,8 @@
 批量提交邮件头信息（`message_id`、`in_reply_to`、`references`、发送时间、主题，
 以及可选的保留截止时间 `retain_until`），服务将其归并为**稳定排序的会话树**，
 并给出**重复 ID、缺失引用、引用环**三类诊断。批次请求与归并结果均持久化到 SQLite，
-可随时查询。此外支持**会话冻结 / 解除冻结**与按保留期的**到期批量清理**
-（删除中间节点时自动压缩会话树，支持 `dry_run` 预览）。
+可随时查询。此外支持**会话活跃冻结 / 解除冻结**（保护随会话拓扑实时生效）与
+按保留期的**到期批量清理**（删除中间节点时自动压缩会话树，支持 `dry_run` 预览）。
 
 ## 一条命令启动
 
@@ -52,7 +52,7 @@ ports:
 | `GET` | `/messages/{message_id}` | 查询单封邮件及其最终父节点（含 `retain_until` 与 `frozen` 状态） |
 | `GET` | `/threads/{message_id}` | 查询该邮件所属完整会话树；环邮件返回 **409** |
 | `GET` | `/threads/{message_id}/page?limit=&cursor=` | 会话树**游标分页**（先序扁平展开，含 `depth`），适配大型会话 |
-| `POST` | `/retention/freezes` | **冻结**某封有效邮件当前所在的整棵会话 |
+| `POST` | `/retention/freezes` | **冻结**某封有效邮件当前所在的整棵会话（活跃冻结，随拓扑自动扩张） |
 | `POST` | `/retention/unfreezes` | **解除**以某封邮件为锚点的冻结 |
 | `POST` | `/retention/cleanups` | **批量清理**截止时间前到期、且未受冻结保护的有效邮件（可 `dry_run`） |
 | `GET` | `/health` | 健康检查 |
@@ -277,8 +277,8 @@ curl -X POST http://localhost:8000/batches \
 
 ### 冻结 / 解除冻结：`POST /retention/freezes`、`POST /retention/unfreezes`
 
-以会话内**任意一封有效邮件为锚点**发起冻结，会冻结其**当前所在的整棵会话**
-（冻结时刻的成员快照，按先序返回）：
+以会话内**任意一封有效邮件为锚点**发起冻结，即保护其**当前所在的整棵会话**
+（响应 `members` 为操作时刻的当前会话成员，按先序返回）：
 
 ```bash
 # 以深层邮件 C 为锚点：A、B、C 全部进入保护
@@ -296,11 +296,17 @@ curl -X POST http://localhost:8000/retention/freezes \
 }
 ```
 
-冻结语义：
+冻结语义（**活跃冻结**，随会话拓扑实时生效）：
 
-- 冻结**只保护冻结时刻的会话成员快照**：此后新归档并挂入该会话的邮件不受保护；
-  对同一锚点再次调用即为**刷新**（`created: false`），按当前会话重写成员快照；
-- 同一棵会话可以由不同锚点多次冻结，保护取**并集**；
+- 冻结只持久化锚点，保护集始终按**当前父子关系**实时计算：冻结后经新批次
+  归档或 `POST /relinks` 并入该会话的邮件**自动受保护，无需再次冻结**；
+  被冻结会话整体并入另一棵树时，保护同样跟随锚点延伸到新会话；
+- 对同一锚点重复调用为幂等确认（`created: false`），`members` 仍返回操作
+  时刻的当前会话成员；
+- 同一棵会话可以由不同锚点多次冻结，保护取**并集**；解除一个锚点**不会**
+  释放仍被其它锚点覆盖的邮件；
+- `members`、`released_members` 与 `GET /messages/{id}` 的 `frozen` 均反映
+  **操作时的当前保护关系**；
 - 锚点邮件不存在返回 **404**；锚点是引用环内 `invalid` 邮件（不属于任何会话）
   返回 **409**。
 
@@ -316,7 +322,7 @@ curl -X POST http://localhost:8000/retention/unfreezes \
   "anchor_id": "C",
   "root_id": "A",
   "frozen_at": "2026-09-19T03:00:00Z",
-  "released_members": ["A", "B", "C"],   // 不再被任何冻结覆盖的成员
+  "released_members": ["A", "B", "C"],   // 不再被任何冻结覆盖的成员（按解除时当前会话计算）
   "still_protected": []                  // 仍被其它冻结覆盖的成员（多冻结重叠时）
 }
 ```
@@ -328,14 +334,16 @@ curl -X POST http://localhost:8000/retention/unfreezes \
 请求体给出截止时刻 `cutoff`（缺省为当前 UTC）与 `dry_run` 开关：
 
 - 删除条件：`is_invalid = 0`（有效邮件）**且** `retain_until` 非空
-  **且** `retain_until <= cutoff`（边界包含）**且**不被任何冻结成员快照覆盖；
+  **且** `retain_until <= cutoff`（边界包含）**且**不被任何活跃冻结覆盖
+  （保护集按清理时的当前父子关系实时计算，取各冻结锚点当前会话的并集）；
 - 未设置 `retain_until` 的邮件永不因到期被删；环内 `invalid` 邮件从不参与；
 - **会话压缩**：删除节点后，仍保留的后代沿父链跳过全部被删节点，重挂到
   **最近的保留祖先**；链顶没有存活祖先时**成为新根**；
 - 响应返回删除 ID（`deleted_ids`）以及每个受影响存活节点的
   `old_parent_id` / `new_parent_id` / `old_root_id` / `new_root_id`
   （祖先链中间被删只改父指针；根被删时整棵剩余子树的根随之改变）；
-- `dry_run: true` 与实际清理**使用完全相同的算法**，只计算并返回结果、**不写库**；
+- `dry_run: true` 与实际清理**使用完全相同的算法**，在同一事务视图中按当前
+  父子关系计算保护集与删除集，只计算并返回结果、**不写库**；
 - 实际清理在**单事务**内完成全部重挂与删除，要么全部生效、要么全部回滚；
 - 清理后 `GET /threads`、`GET /threads/.../page`、`GET /messages` **立即**反映
   压缩后的结构（压缩前领取的分页游标会收到 **409** `cursor_stale`，重新从首页
@@ -404,13 +412,15 @@ SQLite（WAL 模式），表在服务启动时自动创建：
 - `batch_duplicates` / `batch_missing_refs` / `batch_cycles`：诊断明细；
 - `batch_results`：完整结果 JSON 快照，`GET /batches/{id}` 原样返回（补链、保留期
   清理只更新/删除 `messages`，快照与诊断表永不改写）；
-- `retention_freezes` / `retention_freeze_members`：冻结锚点与会话成员快照。
+- `retention_freezes`：冻结锚点（活跃冻结只存锚点；保护集按锚点当前所在会话的
+  父子关系实时计算，不落库成员快照）。
 
 写操作在进程内串行化（线程锁 + 单连接写事务），保证并发提交 / 补链 / 冻结 /
 清理下的归并一致性；保留期实际清理的全部重挂与删除在**单个事务**内提交。
 
-服务启动的建表 DDL 幂等；早期数据库（`messages` 无 `retain_until` 列、无冻结表）
-会在启动时自动补列、补表并建立保留期索引，无需手工迁移。
+服务启动的建表 DDL 幂等；早期数据库（`messages` 无 `retain_until` 列、无冻结表，
+或存在旧版快照成员表 `retention_freeze_members`）会在启动时自动补列、补表、
+建立保留期索引并删除已废弃的快照成员表，无需手工迁移。
 
 ## 本地开发（不使用 Docker）
 

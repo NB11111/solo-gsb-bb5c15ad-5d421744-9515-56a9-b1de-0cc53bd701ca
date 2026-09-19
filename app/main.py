@@ -33,10 +33,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_title,
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "批量提交邮件头信息，归并为稳定排序的会话树，诊断重复 ID / 缺失引用 / 引用环；"
-        "支持邮件保留期（retain_until）、会话冻结/解除冻结与到期批量清理。"
+        "支持邮件保留期（retain_until）、会话活跃冻结/解除冻结与到期批量清理。"
     ),
     lifespan=lifespan,
 )
@@ -183,7 +183,7 @@ def get_thread_page(
     "/retention/freezes",
     response_model=FreezeResult,
     tags=["retention"],
-    summary="冻结某封有效邮件当前所在的整棵会话，使其不被保留期清理删除",
+    summary="冻结某封有效邮件当前所在的整棵会话（活跃冻结，随拓扑自动扩张），使其不被保留期清理删除",
 )
 def freeze_thread(payload: FreezeIn) -> dict:
     try:
@@ -216,7 +216,7 @@ def unfreeze_thread(payload: UnfreezeIn) -> dict:
     "/retention/cleanups",
     response_model=CleanupResult,
     tags=["retention"],
-    summary="批量清理截止时间前已到期且未受冻结保护的有效邮件（可 dry_run 预览）",
+    summary="批量清理截止时间前已到期且未受活跃冻结保护的有效邮件（可 dry_run 预览）",
 )
 def cleanup_messages(payload: CleanupIn) -> dict:
     return service.cleanup_messages(payload)
